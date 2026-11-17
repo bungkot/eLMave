@@ -95,7 +95,7 @@ configuration:
 src/
   gateway/        http.ts, ws.ts, auth.ts
   sdk/            host.ts, plugins.ts, permissions.ts
-  agent/          planner.ts, react-loop.ts, structured-output.ts, sub-agent.ts
+  agent/          planner.ts, structured-output.ts, sub-agent.ts   (no react-loop.ts — SDK owns the loop; rev 0.3)
   policy/         policy-engine.ts, review-policy.ts, risk-scorer.ts, approval-gateway.ts
   guard/          scope-guard.ts, sanitizer.ts, schema-pinning.ts, verifier.ts
   tools/          registry.ts, tool-spec.ts, mcp-adapter.ts, adapters/*, local-tools/*
@@ -182,15 +182,19 @@ scripts/
 
 ## 5. Per-phase implementation flow
 
-| Phase | Core modules | Brief gate | Status |
+The roadmap is organized into three tracks (rev 0.4): **A** = agentic code development
+(TS + OpenCode SDK + Ollama), **B** = agentic scanning (tools), **C** = MCP development.
+
+| Phase / Track | Core modules | Brief gate | Status |
 | --- | --- | --- | --- |
-| 0 | scaffolding, `package.json`, `tsconfig`, Vitest, CI | typecheck + tests green | Not started |
-| 1 | `sdk/host`, `tools/registry`, `agent/planner` | structured output valid; tools without `schemaHash` rejected | Not started |
-| 2 | `guard/scope-guard`, `policy/*`, `runtime/audit-log` | negative tests deny; audit chain verified | Not started |
-| 3 | `runtime/execution-broker`, `sandbox`, `sanitizer`, `verifier` | egress deny; findings without evidence rejected | Not started |
-| 4 | `tools/mcp-adapter`, `schema-pinning`, catalog, open-source wrapping | `lab_<tool>` discovery; quarantine works | Not started |
-| 5 | `memory/*`, `agent/sub-agent`, lab `yolo` mode | session isolation; yolo cannot enable post/shell | Not started |
-| 6 | observability, packaging, hardening | E2E green; runbook exists | Not started |
+| 0 / A0 | scaffolding, `package.json`, `tsconfig`, Vitest, CI | typecheck + tests green | Not started |
+| 1 / A1 | `sdk/host` (Ollama provider), `tools/registry`, thin `agent/planner`, `ctx.tool.transform` | structured output valid; tools without `schemaHash` rejected; Ollama tool-call verified | Not started |
+| 2 / A2 | `guard/scope-guard`, `policy/*`, `runtime/audit-log` | negative tests deny; audit chain verified | Not started |
+| 3 / A3 | `runtime/execution-broker`, `sandbox`, `sanitizer`, `verifier`, `evidence-store` | egress deny; findings without evidence rejected | Not started |
+| 4 / B1–B3 | `tools/local-tools/*`, `tools/adapters/*`, scanning session | read-only tool with evidence; post/shell deny; provenance recorded | Not started |
+| 4 / C1–C4 | `tools/mcp-adapter`, `schema-pinning`, catalog | `lab_<tool>` discovery; quarantine works; MCP `callTool` → broker | Not started |
+| 5 / A5 | `memory/*`, `agent/sub-agent`, lab `yolo` mode | session isolation; yolo cannot enable post/shell | Not started |
+| 6 / A6 | observability, packaging, hardening | E2E green; runbook exists | Not started |
 
 Deliverable, task, and gate-evidence details are in `docs/roadmap.md`.
 
@@ -201,6 +205,13 @@ Deliverable, task, and gate-evidence details are in `docs/roadmap.md`.
 3. `AuditLog` before `ExecutionBroker` executes.
 4. `Sanitizer`/`Verifier` before observations enter the LLM context.
 5. `ExecutionBroker` before the MCP adapter is connected to OpenCode.
+
+> **Design rev 0.3 (binding).** OpenCode SDK **is the agent** and owns the ReAct loop — do not
+> implement a second `react-loop.ts`. `agent/*` is limited to thin helpers (structured output,
+> `Verifier`, sub-agent prompts). All guardrails are enforced by `wrapTool` inside
+> `ctx.tool.transform`, which is the **only** caller of `ExecutionBroker.execute` (design §4.2.1).
+> Ollama is the local LLM provider (OpenAI-compatible `/v1`, model pinned by digest), configured in
+> the OpenCode config the in-process host loads; it is not a transport "through" the SDK.
 
 ### 5.2 Per-phase definition of done
 
@@ -333,7 +344,14 @@ stays in the TypeScript `PolicyEngine` (ADR-003). Built-in tools (`shell`,
 `edit`, `write`) are wrapped, disabled via `permissions`/`policies`, or removed
 via `editor.remove(...)`; `DisableToolUse` turns off all tools.
 
+`wrapTool` (design §4.2.1) is the **only** caller of `ExecutionBroker.execute`. Do not add a second
+policy evaluation or a second TS loop; MCP `callTool` is translated into `broker.execute` and each
+execution produces exactly one audit entry.
+
 ### 6.10 Agent loop
+
+> The loop is executed by the OpenCode SDK agent (design rev 0.3). The sequence below is the
+> **policy contract of `wrapTool` per tool call**, not a second loop implemented in TypeScript.
 
 `planner.plan` → `selectAction` (Zod-validated) → `audit.planned` →
 `scopeGuard.assertInScope` → `policy.evaluate` → `audit.allowed`/`audit.asked` →

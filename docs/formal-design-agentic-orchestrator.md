@@ -1,6 +1,7 @@
 # Formal Design — LLM-Assisted Exploitation Orchestrator
 
 - Date: 2026-11-17
+- Revision: 0.4 — SDK-as-agent decision locked in 0.3; three-track cross-ref in 0.4 (see §14)
 - Status: architecture design (no product implementation yet)
 - Role: System Architect + Cybersecurity Analyst
 - Derived from: `docs/harness-analysis.md`,
@@ -33,6 +34,7 @@
 11. [TypeScript Module Structure](#11-typescript-module-structure)
 12. [Roadmap and Gates](#12-roadmap-and-gates)
 13. [Appendix](#13-appendix)
+14. [Revision history](#14-revision-history)
 
 ---
 
@@ -62,12 +64,12 @@
 
 | ADR | Decision | Rationale | Trade-off |
 | --- | --- | --- | --- |
-| ADR-001 | OpenCode SDK **in-process** on Node 22+ | Node 22 provides `Promise.withResolvers` & `Symbol.asyncDispose`, removing the SDK blocker on Electron 27 (Node 18) | Requires our own HTTP/WS gateway; SDK is only an in-memory router |
+| ADR-001 | OpenCode SDK **in-process** on Node 22+ and **is the agent** (owns the ReAct loop). Ollama is a local LLM provider configured as OpenAI-compatible, not "connected through" the SDK as a transport | Node 22 provides `Promise.withResolvers` & `Symbol.asyncDispose`, removing the SDK blocker on Electron 27 (Node 18); OpenCode already provides planning, tool-calling and sessions, so a second TS loop would be redundant (rev 0.3) | Requires our own HTTP/WS gateway; SDK is only an in-memory router; local-model tool-calling quality must be verified before offensive tools |
 | ADR-002 | **MCP-first** + local TS tools | Fast access to the tool ecosystem; full control in the control plane | Most MCPs are stdio → requires containerization & limits |
 | ADR-003 | **TypeScript PolicyEngine** as the primary authorization | SDK `permissions` uses `resource: "*"`, too coarse for targets/tenants | Requires our own implementation & testing |
 | ADR-004 | Web/CLI-first, target = **our own server** | Compliant with permission; removes dual-renderer & Electron hardening complexity | Server RCE risk rises → requires sandbox & egress deny |
 | ADR-005 | `yolo` **only** in an isolated lab | The proto document states yolo is "only for controlled environments" | Default mode remains `manual` |
-| ADR-006 | All tools go through `ExecutionBroker` | Patches the document finding: direct MCP calls bypass ReviewPolicy | A single choke point → must be reliable & audited |
+| ADR-006 | All tools go through `ExecutionBroker`, invoked from `ctx.tool.transform` by `wrapTool` (§4.2.1). There is no second TS loop calling the broker | Patches the document finding: direct MCP calls bypass ReviewPolicy; with the SDK owning the loop, the transform wrapper is the only place to enforce it (rev 0.3) | A single choke point → must be reliable & audited; one audit entry per execution |
 
 ---
 
@@ -84,19 +86,18 @@
    └───────────────────────┬──────────────────────────────────┘
                            ▼
    ┌──────────────────────────────────────────────────────────┐
-   │  OpenCode SDK (in-process host)                           │
-   │  OpenCode.create() → sessions.create() → prompt()         │
-   │  plugin: ctx.tool.transform + ctx.mcp.transform           │
+   │  OpenCode SDK (in-process host) = THE AGENT                │
+   │  OpenCode.create() → sessions.create() → prompt()          │
+   │  OpenCode owns ReAct loop + tool-calling                   │
+   │  LLM provider: Ollama (local, OpenAI-compatible /v1)       │
+   │  plugin: ctx.tool.transform + ctx.mcp.transform            │
+   │  thin TS helpers: structured output · Verifier · sub-agent  │
    └───────────────────────┬──────────────────────────────────┘
-                           │ Planner/Reasoner (structured output)
+                           │ every tool call wrapped (§4.2.1)
                            ▼
    ┌──────────────────────────────────────────────────────────┐
-   │  Agent Core                                               │
-   │  Planner · ReAct loop · Sub-agent · Verifier              │
-   └───────────────────────┬──────────────────────────────────┘
-                           ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  ScopeGuard  →  PolicyEngine  →  ApprovalGateway          │
+   │  ctx.tool.transform → wrapTool (all tools, no 2nd loop)   │
+   │  ScopeGuard → PolicyEngine → ApprovalGateway              │
    │  (hard deny)   (allow/ask/deny) (manual/ai)               │
    └───────────────────────┬──────────────────────────────────┘
                            ▼
@@ -124,7 +125,9 @@
 | Component | Responsibility | Why mandatory |
 | --- | --- | --- |
 | `Gateway` | Operator auth, translates web/CLI requests → SDK session | SDK is not a network listener |
-| `AgentCore` | Plan, reason, select action, reflect, sub-agent | Matches `EnablePlan`, `AIExecutionStrategy` |
+| `OpenCode SDK agent` | Owns the ReAct loop, planning and tool-calling | ADR-001; no second `react-loop.ts` (rev 0.3) |
+| `AgentCore` (thin helpers) | Structured output, `Verifier`, sub-agent prompts | Matches `EnablePlan`, `AIExecutionStrategy` without a second loop |
+| `Tool transform wrapper` | `ctx.tool.transform` → `wrapTool`: guardrails + `broker.execute` | The only caller of `ExecutionBroker` (rev 0.3) |
 | `ScopeGuard` | Ensures the target is on the official list | Hard deny before anything |
 | `PolicyEngine` | `allow / ask / deny` based on actor, risk, sideEffects | `ReviewPolicy` + `AIReviewRiskControlScore` |
 | `ApprovalGateway` | Human/AI review for dangerous actions | Human checkpoint |
@@ -154,6 +157,21 @@ export async function createHost() {
 Note: the SDK is an **in-process host with an in-memory HTTP router**, not a listener. Our own
 Gateway is still required to accept Web/CLI requests.
 
+The SDK **is the agent**: the ReAct loop, planning, and tool-calling belong to OpenCode. We do
+**not** implement a second `react-loop.ts`. `agent/*` is reduced to thin helpers (structured-output
+schemas, `Verifier`, sub-agent prompts) invoked around SDK sessions.
+
+**Ollama is the LLM provider, not something the SDK "connects to" on behalf of our TS code.**
+It is configured as an OpenAI-compatible provider (local `/v1` endpoint) in the OpenCode
+configuration that the in-process host loads. The model is pinned by digest. Provider
+compatibility and local-model tool-calling quality must be verified before any offensive tool is
+enabled (see §12 gate and revision 0.3). Keeping inference local also keeps prompts, code, and
+credentials off external APIs (T05).
+
+Two SDK sessions with different tool-sets preserve separation of duties: a *code-dev* session
+(filesystem/edit tools only) and a *scanning* session (`recon`/`scan`, with `post`/`shell` never
+allowed).
+
 ### 4.2 Plugin — main choke point
 
 ```ts
@@ -178,6 +196,39 @@ await ctx.mcp.transform((editor) => {
 - MCP server instructions and resources also enter the OpenCode system prompt; both must be
   filtered/sanitized (`Sanitizer`, T02/T10), not just tool results.
 - `codemode: false` for small & curated catalogs; `true` for large catalogs.
+
+### 4.2.1 `wrapTool` — the single execution gate
+
+Because OpenCode owns the loop, **all guardrails are enforced inside `ctx.tool.transform`**, and
+the wrapper is the only caller of `ExecutionBroker.execute`. There is no second policy engine and
+no second TS loop calling the broker (rev 0.3).
+
+```ts
+function wrapTool(draft: ToolDraft) {
+  draft.execute = async (args: Record<string, unknown>) => {
+    const action = agentActionFrom(draft, args)          // validated against ToolSpec.params
+    scopeGuard.assertInScope(action.target, scope)       // hard deny
+    const decision = policy.evaluate({ action, reviewPolicy, score, actor })
+    if (decision === 'deny') { audit.denied(action); return denyResult() }
+    if (decision === 'ask') {
+      const review = await approval.request(action, actionPlan) // ctx.permission.assert / gateway
+      if (!review.approved) { audit.rejected(action); return rejectResult() }
+      audit.approved(action, review.approver)
+    }
+    return broker.execute(action)                         // sandbox + timeout + evidence + audit
+  }
+  return draft
+}
+```
+
+Rules:
+
+- Built-in `shell`, `edit`, `write` are removed via `editor.remove(...)` (or denied via permissions)
+  unless a dedicated session explicitly needs them.
+- MCP `callTool` is translated into `broker.execute`; it never calls a tool implementation directly.
+- Exactly **one audit entry per execution**, including tools reached through MCP.
+- MCP server instructions/resources and tool descriptions pass the `Sanitizer` before entering the
+  system prompt (T02/T03/T10).
 
 ### 4.3 Permission SDK — deny by default
 
@@ -365,6 +416,11 @@ Note: the left column is the Yakit proto field (`AIStartParams`) mapped to our m
 
 ### 7.2 Loop
 
+> **Revision 0.3.** The loop is executed by the OpenCode SDK agent, not by a second TypeScript
+> loop that we run. The snippet below is the **policy contract implemented by `wrapTool` (§4.2.1)**
+> for each tool call; `planner.plan()` is a thin structured-output helper around an SDK session,
+> not a replacement for OpenCode's ReAct loop. See ADR-001/ADR-006.
+
 ```ts
 for (let i = 0; i < MAX_ITERATIONS; i++) {
   const observation = lastResult?.observation ?? task       // not trusted
@@ -492,7 +548,7 @@ export interface AuditEntry {
 src/
   gateway/        http.ts, ws.ts, auth.ts
   sdk/            host.ts, plugins.ts, permissions.ts
-  agent/          planner.ts, react-loop.ts, structured-output.ts, sub-agent.ts
+  agent/          planner.ts, structured-output.ts, sub-agent.ts   (no react-loop.ts — SDK owns the loop; rev 0.3)
   policy/         policy-engine.ts, review-policy.ts, risk-scorer.ts, approval-gateway.ts
   guard/          scope-guard.ts, sanitizer.ts, schema-pinning.ts, verifier.ts
   tools/          registry.ts, tool-spec.ts, mcp-adapter.ts, local-tools/*
@@ -505,16 +561,18 @@ src/
 
 ## 12. Roadmap and Gates
 
-The full operational roadmap (Phase 0–6) is in `docs/roadmap.md`; the table below summarizes
-the binding core phases 1–5.
+The full operational roadmap is in `docs/roadmap.md`, organized since rev 0.4 into **three
+tracks**: **A** = agentic code development (TypeScript + OpenCode SDK + Ollama),
+**B** = agentic scanning (tools), **C** = MCP development. Old Phase 0–6 tags are retained in
+parentheses in the roadmap. The table below maps the binding core phases 1–5 to those tracks.
 
-| Phase | Deliverable | Security gate |
+| Phase / Track | Deliverable | Security gate |
 | --- | --- | --- |
-| 1 | Gateway + SDK host + ToolRegistry + Planner (read-only tools) | Valid structured output; tools without schemaHash denied |
-| 2 | ScopeGuard + PolicyEngine + ApprovalGateway + AuditLog | Negative tests: out-of-scope → deny; post/shell → deny under ai/yolo |
-| 3 | ExecutionBroker + sandbox + sanitizer + verifier | Egress deny; findings without evidence denied |
-| 4 | MCP adapter + schema pinning + catalog (force sync) | Changed tool → quarantine; complete audit |
-| 5 | Memory/RAG + sub-agent + yolo (lab only) | Session isolation; yolo cannot enable post/shell |
+| 1 / A1 | Gateway + SDK host (Ollama provider) + ToolRegistry + thin Planner (read-only tools) | Valid structured output; tools without schemaHash denied; Ollama tool-calling verified |
+| 2 / A2 | ScopeGuard + PolicyEngine + ApprovalGateway + AuditLog | Negative tests: out-of-scope → deny; post/shell → deny under ai/yolo |
+| 3 / A3 | ExecutionBroker + sandbox + sanitizer + verifier | Egress deny; findings without evidence denied |
+| 4 / B1–B3 + C1–C4 | MCP adapter + schema pinning + catalog (force sync) + scanning tools | Changed tool → quarantine; complete audit; MCP `callTool` → broker (no bypass) |
+| 5 / A5 | Memory/RAG + sub-agent + yolo (lab only) | Session isolation; yolo cannot enable post/shell |
 
 Definition of done for each phase: `tsc` + green Vitest, the related threat model IDs closed, and
 the audit chain verified.
@@ -555,6 +613,20 @@ the audit chain verified.
 
 > The earlier "advanced analysis (chat)" reference was not persistent; the claims above have been
 > re-verified against the official OpenCode V2 documentation on 2026-11-17.
+
+---
+
+## 14. Revision history
+
+| Date | Revision | Changes |
+| --- | --- | --- |
+| 2026-11-17 | 0.1 | Initial binding design: ADR-001..006, architecture, matrices, threat model, §§1–13. |
+| 2026-11-17 | 0.3 | **Locked architecture decision:** OpenCode SDK is the agent and owns the ReAct loop; Ollama is a local LLM provider (OpenAI-compatible `/v1`), pinned by digest — not "connected through" the SDK as a transport. No second `react-loop.ts`; `agent/*` reduced to thin helpers. All guardrails enforced in `ctx.tool.transform` → `wrapTool` → `ExecutionBroker.execute` (ADR-006). MCP `callTool` routed through the broker; one audit entry per execution. Affects §2 (ADR-001/006), §3, §4.1, §4.2.1 (new), §7.2. |
+| 2026-11-17 | 0.4 | Cross-reference update only: §12 reflects roadmap rev 0.4 three-track structure (A/B/C). No ADR, permission-matrix, or threat-model change. |
+
+> Revision 0.3 does **not** change permission matrix §6, threat model T01–T13, or the default
+> `manual` policy. It resolves the loop/gate ambiguity between §3–§4 and §7.2. Verification of
+> provider compatibility and local-model tool-calling is a Fase 0/1 gate (roadmap §4, Phase 1).
 
 ---
 
